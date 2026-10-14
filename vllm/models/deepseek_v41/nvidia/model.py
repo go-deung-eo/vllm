@@ -1222,6 +1222,8 @@ def _make_deepseek_v4_weights_mapper(
             # renames the engram fp8 table but not its scale; route the
             # scale explicitly to the same module.
             re.compile(r"(engram\.embed)\.scale$"): r"\1_tokens.weight_scale_inv",
+            # NGQ2 2-bit records keep their codebook base table next to the records.
+            re.compile(r"(engram\.embed)\.tlut$"): r"\1_tokens.tlut",
             re.compile(r"\.scale$"): f".{linear_scale_name}",
         }
     else:
@@ -1235,6 +1237,7 @@ def _make_deepseek_v4_weights_mapper(
             ): r"\1.weight_scale_inv",
             # Same engram reroute as the fp4 branch above.
             re.compile(r"(engram\.embed)\.scale$"): r"\1_tokens.weight_scale_inv",
+            re.compile(r"(engram\.embed)\.tlut$"): r"\1_tokens.tlut",
             re.compile(r"\.scale$"): f".{linear_scale_name}",
         }
     return WeightsMapper(

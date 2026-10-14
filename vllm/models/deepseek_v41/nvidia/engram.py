@@ -441,9 +441,16 @@ class Engram(BaseEngram):
     def _create_embedding(
         self, layout: EngramLayout, layer_hash_index: int
     ) -> ParallelEngramEmbedding:
-        engram_config = get_current_vllm_config().engram_config
+        vllm_config = get_current_vllm_config()
+        engram_config = vllm_config.engram_config
         assert engram_config is not None
-        return ParallelEngramEmbedding(
+        cls = ParallelEngramEmbedding
+        if getattr(vllm_config.model_config.hf_config, "engram_table_format", None) == "ngq2":
+            # 2-bit trellis records (NGQ2 release) decoded in the lookup kernel
+            from vllm.models.deepseek_v41.nvidia.engram_ngq2 import Ngq2ParallelEngramEmbedding
+
+            cls = Ngq2ParallelEngramEmbedding
+        return cls(
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
