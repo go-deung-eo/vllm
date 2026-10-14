@@ -40,9 +40,14 @@ from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLEPinnedHostEmbedding,
+    Qwen4ExpPLENgq2EmbeddingMethod,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
 )
+from vllm.models.qwen4_exp.common.ngq2_codec import REC_BYTES as NGQ2_REC_BYTES
+from vllm.models.qwen4_exp.common.ngq2_codec import decode_records as ngq2_decode_records
+from vllm.models.qwen4_exp.common.ngq2_codec import gather_decode as ngq2_gather_decode
 from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPLELayer
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.utils.torch_utils import weak_ref_tensor
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadata,
@@ -2088,3 +2093,255 @@ def test_amd_pinned_embedding_output_written_under_cudagraph_capture(
 
         expected = loaded_weight[ngram_ids.cpu()].to(device="cuda:0").flatten(-2)
         torch.testing.assert_close(output.float(), expected.float(), rtol=0, atol=0)
+
+
+# --------------------------------------------------------------------------- NGQ2 (2-bit trellis records)
+
+
+def _ngq2_reference_decode(records: torch.Tensor, tlut: torch.Tensor) -> torch.Tensor:
+    """Pure-torch decoder of 42-byte NGQ2 records (spec in common/ngq2_codec.py)."""
+    n = records.shape[0]
+    b = records[:, :40].to(torch.int64)
+    nib = torch.stack([b >> 4, b & 0xF], dim=-1).reshape(n, 80)
+    i = torch.arange(80, device=records.device)
+    state = (
+        (nib[:, (i - 3) % 80] << 12)
+        | (nib[:, (i - 2) % 80] << 8)
+        | (nib[:, (i - 1) % 80] << 4)
+        | nib[:, i]
+    )
+    u = ((state + 1) * state) & 0xFFFFFFFF
+    sign = 1.0 - 2.0 * ((u >> 15) & 1).to(torch.float32)
+    idx = (u >> 6) & 511
+    gain = records[:, 40:42].contiguous().view(torch.bfloat16).view(n).float()
+    v = tlut.to(records.device)[idx]  # [n, 80, 2]
+    v0 = v[..., 0] * sign * gain[:, None]
+    v1 = v[..., 1] * gain[:, None]
+    return torch.stack([v0, v1], dim=-1).reshape(n, 160).to(torch.bfloat16)
+
+
+def _random_ngq2_records(n: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    g = torch.Generator(device=device).manual_seed(0)
+    records = torch.randint(0, 256, (n, NGQ2_REC_BYTES), dtype=torch.uint8, device=device, generator=g)
+    gains = (torch.rand(n, device=device, generator=g) * 0.2 + 1e-4).to(torch.bfloat16)
+    records[:, 40:42] = gains.contiguous().view(torch.uint8).view(n, 2)
+    tlut = torch.randn(512, 2, device=device, generator=g)
+    return records, tlut
+
+
+def test_ple_embedding_method_selects_ngq2_from_embedding_dtype() -> None:
+    prefix = "model.layers.1.ple.ple_embedding.ngram_embedding"
+    assert isinstance(
+        Qwen4ExpPLEEmbeddingMethod.from_quant_config(None, prefix, "ngq2"),
+        Qwen4ExpPLENgq2EmbeddingMethod,
+    )
+    # The PLE format is independent of the backbone quantization config.
+    assert isinstance(
+        Qwen4ExpPLEEmbeddingMethod.from_quant_config(
+            Fp8Config(is_checkpoint_fp8_serialized=True), prefix, "ngq2"
+        ),
+        Qwen4ExpPLENgq2EmbeddingMethod,
+    )
+
+
+def test_ngram_embedding_loads_ngq2_record_shards_and_tlut() -> None:
+    module = _make_ngram_embedding_for_load_test()
+    embedding = nn.Module()
+    embedding.org_vocab_size = 8
+    embedding.embedding_dim = 160
+    embedding.shard_indices = SimpleNamespace(
+        org_vocab_start_index=2,
+        org_vocab_end_index=6,
+    )
+    embedding.register_parameter(
+        "weight",
+        nn.Parameter(torch.zeros(4, NGQ2_REC_BYTES, dtype=torch.uint8), requires_grad=False),
+    )
+    tlut = nn.Parameter(torch.zeros(512, 2, dtype=torch.float32), requires_grad=False)
+    tlut.weight_loader = default_weight_loader
+    embedding.register_parameter("tlut", tlut)
+    _set_test_embedding_weight_loader(embedding)
+    module.ngram_embedding = embedding
+
+    shard_0 = torch.arange(4 * NGQ2_REC_BYTES, dtype=torch.int32).reshape(4, NGQ2_REC_BYTES).to(torch.uint8)
+    shard_1 = (torch.arange(4 * NGQ2_REC_BYTES, dtype=torch.int32).reshape(4, NGQ2_REC_BYTES) + 7).to(torch.uint8)
+    expected_tlut = torch.randn(512, 2)
+
+    loaded = module.load_weights(
+        [
+            ("ngram_embedding.shard_0.weight", shard_0),
+            ("ngram_embedding.shard_1.weight", shard_1),
+            ("ngram_embedding.tlut", expected_tlut),
+        ]
+    )
+
+    assert loaded == {"ngram_embedding.weight", "ngram_embedding.tlut"}
+    assert module.ngram_embedding.weight.dtype == torch.uint8
+    assert torch.equal(module.ngram_embedding.weight, torch.cat((shard_0[2:4], shard_1[0:2])))
+    torch.testing.assert_close(module.ngram_embedding.tlut, expected_tlut)
+    Qwen4ExpPLENgq2EmbeddingMethod().process_weights_after_loading(module.ngram_embedding)
+
+
+def test_ngram_embedding_rejects_ngq2_shard_with_wrong_record_width() -> None:
+    module = _make_ngram_embedding_for_load_test()
+    module.ngram_embedding.weight = nn.Parameter(
+        torch.zeros(4, NGQ2_REC_BYTES, dtype=torch.uint8), requires_grad=False
+    )
+    _set_test_embedding_weight_loader(module.ngram_embedding)
+    with pytest.raises(ValueError, match="Shape mismatch"):
+        module.load_weights([("ngram_embedding.shard_0.weight", torch.zeros(4, 160, dtype=torch.uint8))])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton decoder needs CUDA")
+def test_ngq2_decode_matches_torch_reference() -> None:
+    device = torch.device("cuda")
+    records, tlut = _random_ngq2_records(4096, device)
+    decoded = ngq2_decode_records(records, tlut)
+    assert decoded.dtype == torch.bfloat16 and decoded.shape == (4096, 160)
+    assert torch.equal(decoded, _ngq2_reference_decode(records, tlut))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton decoder needs CUDA")
+def test_ple_ngq2_embedding_dequantizes_gathered_records() -> None:
+    device = torch.device("cuda")
+    records, tlut = _random_ngq2_records(6 * 16, device)
+    layer = nn.Module()
+    layer.register_parameter("tlut", nn.Parameter(tlut, requires_grad=False))
+    method = Qwen4ExpPLENgq2EmbeddingMethod()
+    lookup_output = records.view(6, 16 * NGQ2_REC_BYTES)  # 6 tokens x 16 heads of raw records
+
+    out = method.dequantize(layer, lookup_output, torch.bfloat16)
+
+    assert out.shape == (6, 16 * 160) and out.dtype == torch.bfloat16
+    assert torch.equal(out.view(-1, 160), _ngq2_reference_decode(records, tlut))
+    # bf16 input is the fused device lookup's already-decoded output: passed through unchanged.
+    decoded = out.clone()
+    assert method.dequantize(layer, decoded, torch.bfloat16).data_ptr() == decoded.data_ptr()
+    with pytest.raises(RuntimeError, match="uint8"):
+        method.dequantize(layer, lookup_output.to(torch.float16), torch.bfloat16)
+
+
+def test_ple_ngq2_embedding_uses_int8_for_parallel_reduce(monkeypatch) -> None:
+    monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        embedding_module, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(
+        embedding_module,
+        "get_masked_input_and_mask",
+        lambda *args: (
+            torch.tensor([0, 0]),
+            torch.tensor([False, True]),
+        ),
+    )
+    reduced_dtypes = []
+
+    def all_reduce(tensor: torch.Tensor) -> torch.Tensor:
+        reduced_dtypes.append(tensor.dtype)
+        return tensor.clone()
+
+    _mock_etp_group(monkeypatch, world_size=2, all_reduce=all_reduce)
+    layer = Qwen4ExpPLEDeviceEmbedding(
+        4,
+        160,
+        params_dtype=torch.bfloat16,
+        padding_size=1,
+        prefix="test.ple_embedding",
+        embedding_method=Qwen4ExpPLENgq2EmbeddingMethod(),
+    )
+    assert layer.weight.dtype == torch.uint8 and layer.weight.shape == (2, NGQ2_REC_BYTES)
+    layer.weight.data.copy_(
+        torch.arange(2 * NGQ2_REC_BYTES, dtype=torch.int32).reshape(2, NGQ2_REC_BYTES).to(torch.uint8)
+    )
+
+    output = layer(torch.tensor([0, 2]))
+
+    assert reduced_dtypes == [torch.int8]
+    assert output.dtype == torch.uint8
+    assert torch.equal(output[0], layer.weight[0])
+    assert torch.count_nonzero(output[1]) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton decoder needs CUDA")
+@pytest.mark.parametrize("ids_dtype", [torch.int64, torch.int32])
+def test_ngq2_fused_gather_decode_matches_decode_of_indexed_records(ids_dtype) -> None:
+    device = torch.device("cuda")
+    rows = 1000
+    table, tlut = _random_ngq2_records(rows, device)
+    g = torch.Generator(device=device).manual_seed(1)
+    ids = torch.randint(0, rows, (37, 16), device=device, generator=g)
+    ids[0, :4] = torch.tensor([0, rows - 1, 0, rows - 1], device=device)  # edge rows and repeats
+    ids = ids.to(ids_dtype)
+
+    fused = ngq2_gather_decode(table, ids, tlut)
+    two_step = ngq2_decode_records(table[ids.long()], tlut)
+    assert fused.shape == (37, 16, 160) and fused.dtype == torch.bfloat16
+    assert torch.equal(fused.view(torch.int16), two_step.view(torch.int16))  # bit-for-bit
+    assert torch.equal(fused.view(-1, 160), _ngq2_reference_decode(table[ids.long()].view(-1, 42), tlut))
+
+    # Shard masking: the local table holds global rows [300, 700); other ids decode to +0.0.
+    start, end = 300, 700
+    masked = ngq2_gather_decode(table[start:end], ids, tlut, start, end)
+    owned = (ids.long() >= start) & (ids.long() < end)
+    assert owned.any() and (~owned).any()
+    assert torch.equal(masked[owned].view(torch.int16), two_step[owned].view(torch.int16))
+    assert torch.equal(masked[~owned].view(torch.int16), torch.zeros_like(masked[~owned]).view(torch.int16))
+    assert ngq2_gather_decode(table, ids[:0], tlut).shape == (0, 16, 160)
+
+
+def _make_ngq2_device_embedding(monkeypatch, rank: int, world_size: int, all_reduce=lambda t: t):
+    _mock_etp_group(monkeypatch, world_size=world_size, all_reduce=all_reduce)
+    group = ngram_embedding_module.get_etp_group()
+    group.rank_in_group = rank
+    for module in (embedding_module, parameter_module):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: world_size)
+    with torch.device("cuda:0"):
+        return Qwen4ExpPLEDeviceEmbedding(
+            64,
+            160,
+            params_dtype=torch.bfloat16,
+            padding_size=1,
+            prefix="test.ple_embedding",
+            embedding_method=Qwen4ExpPLENgq2EmbeddingMethod(),
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton decoder needs CUDA")
+@pytest.mark.parametrize("world_size", [1, 2, 4])
+def test_ple_ngq2_device_embedding_fused_lookup_is_bit_exact_across_etp(monkeypatch, world_size) -> None:
+    device = torch.device("cuda")
+    table, tlut = _random_ngq2_records(64, device)
+    ids = torch.tensor([[0, 63, 17, 32], [31, 33, 0, 48]], device=device)
+    expected = ngq2_decode_records(table[ids], tlut)
+
+    partials, reduced_dtypes = [], []
+
+    def all_reduce(tensor):
+        reduced_dtypes.append(tensor.dtype)
+        return tensor.clone()
+
+    for rank in range(world_size):
+        layer = _make_ngq2_device_embedding(monkeypatch, rank, world_size, all_reduce)
+        lo = layer.shard_indices.org_vocab_start_index
+        hi = layer.shard_indices.org_vocab_end_index
+        layer.weight.data[: hi - lo].copy_(table[lo:hi])
+        layer.tlut.data.copy_(tlut)
+        out = layer(ids)
+        assert out.dtype == torch.bfloat16 and out.shape == (2, 4, 160)
+        owned = (ids >= lo) & (ids < hi)
+        assert torch.count_nonzero(out[~owned]) == 0
+        partials.append(out)
+        # The PLE layer's dequantize is a pass-through for the decoded rows.
+        assert torch.equal(layer.dequantize(out.flatten(-2), torch.bfloat16), out.flatten(-2))
+
+    # Simulated ETP SUM: one owner per row plus +0.0 from every other rank.
+    total = partials[0]
+    for p in partials[1:]:
+        total = total + p
+    assert torch.equal(total.view(torch.int16), expected.view(torch.int16))
+    assert reduced_dtypes == ([] if world_size == 1 else [torch.bfloat16] * world_size)

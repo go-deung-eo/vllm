@@ -546,8 +546,9 @@ class VocabParallelEmbedding(PluggableLayer):
             if output_parallel.dtype in (
                 torch.float8_e4m3fn,
                 torch.float8_e5m2,
+                torch.uint8,
             ):
-                # Each vocab token has one owner, so FP8 bytes can use int8 SUM.
+                # Each vocab token has one owner, so FP8 / packed bytes can use int8 SUM.
                 comm_output = output_parallel.view(torch.int8)
                 comm_output.masked_fill_(input_mask.unsqueeze(-1), 0)
                 output = (

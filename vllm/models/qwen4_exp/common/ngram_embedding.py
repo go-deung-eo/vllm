@@ -37,12 +37,16 @@ from vllm.model_executor.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 from .ple import PLEVocabParallelEmbedding
+from .ngq2_codec import REC_BYTES as NGQ2_RECORD_BYTES
+from .ngq2_codec import decode_records as ngq2_decode_records
+from .ngq2_codec import gather_decode as ngq2_gather_decode
 
 logger = init_logger(__name__)
 
@@ -169,6 +173,9 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
         embedding_dtype: str | None = None,
     ) -> "Qwen4ExpPLEEmbeddingMethod":
         """Select the concrete PLE embedding format for a layer."""
+        if embedding_dtype == "ngq2":
+            # NGQ2 2-bit trellis records; independent of the backbone quantization.
+            return Qwen4ExpPLENgq2EmbeddingMethod()
         if embedding_dtype == "float8_e4m3fn":
             return Qwen4ExpPLEFp8EmbeddingMethod()
         if quant_config is None:
@@ -320,6 +327,97 @@ class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
         return embeddings.to(output_dtype) * weight_scale.to(output_dtype)
 
 
+class Qwen4ExpPLENgq2EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
+    """NGQ2 PLE embedding: each 160-value row is a 42-byte record (40 B of 2-bit trellis
+    codes + a bf16 per-row gain) decoded on lookup with the shared 512x2 HYB table ``tlut``.
+
+    Device tables use ``lookup_decoded``: one fused Triton launch reads each id, loads its 42 B
+    record from the local shard and writes the bf16 row (ids owned by another TP/ETP shard give
+    zeros, so the ETP all-reduce sums bf16 rows with exactly one non-zero contributor). Pinned
+    tables gather raw records through the UVA kernel (42-element row stride) and ``dequantize``
+    decodes them after the raw-byte all-reduce.
+    """
+
+    def create_weights(
+        self,
+        layer: Qwen4ExpPLEEmbedding,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del input_size, output_size, params_dtype
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        weight = ModelWeightParameter(
+            data=layer.allocate_embedding_weight(
+                sum(output_partition_sizes),
+                NGQ2_RECORD_BYTES,
+                torch.uint8,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+        tlut = nn.Parameter(torch.zeros(512, 2, dtype=torch.float32), requires_grad=False)
+        set_weight_attrs(tlut, {"weight_loader": default_weight_loader})
+        layer.register_parameter("tlut", tlut)
+
+    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        # F.embedding requires a floating weight; gather the uint8 records by indexing.
+        # Only used when the fused path does not apply (CPU tensors).
+        return layer.weight[input_]
+
+    def lookup_decoded(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        """Fused gather+decode of global ids against the local shard, reduced over ETP ranks.
+
+        Returns bf16 [*input_.shape, 160]. Each row has exactly one owning rank and every other
+        rank contributes +0.0, so the bf16 SUM all-reduce reproduces the owner's values exactly
+        (x + 0.0 == x; only a decoded -0.0 would come back as +0.0).
+        """
+        shard = layer.shard_indices
+        if shard.added_vocab_start_index != shard.added_vocab_end_index:
+            raise NotImplementedError("NGQ2 PLE tables have no added vocabulary")
+        out = ngq2_gather_decode(
+            layer.weight,
+            input_,
+            layer.tlut,
+            shard.org_vocab_start_index,
+            shard.org_vocab_end_index,
+        )
+        if layer.tp_size == 1:
+            return out
+        assert layer.parallel_group is not None
+        return layer.parallel_group.all_reduce(out)
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        """Reject NGQ2 PLE checkpoints without the HYB table."""
+        if not torch.any(layer.tlut != 0):
+            raise ValueError("NGQ2 PLE checkpoint is missing its tlut")
+
+    def dequantize(
+        self,
+        layer: nn.Module,
+        embeddings: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if embeddings.dtype == torch.bfloat16:
+            # Already decoded by the fused device lookup (lookup_decoded).
+            return embeddings.to(output_dtype)
+        if embeddings.dtype != torch.uint8:
+            raise RuntimeError("NGQ2 PLE lookup output must be uint8 records or decoded bf16 rows")
+        tlut = layer.tlut
+        if tlut.device != embeddings.device:
+            tlut = tlut.to(embeddings.device)
+        records = embeddings.reshape(-1, NGQ2_RECORD_BYTES)
+        decoded = ngq2_decode_records(records, tlut)  # bf16 [N, embedding_dim]
+        n_rows = embeddings.shape[-1] // NGQ2_RECORD_BYTES
+        out = decoded.reshape(*embeddings.shape[:-1], n_rows * decoded.shape[-1])
+        return out.to(output_dtype)
+
+
 class Qwen4ExpPLEDeviceEmbedding(Qwen4ExpPLEEmbedding):
     """PLE table allocated on the active model device."""
 
@@ -344,7 +442,14 @@ class Qwen4ExpPLEDeviceEmbedding(Qwen4ExpPLEEmbedding):
         """Gather ETP inputs, look up embeddings, and select local rows."""
         slot_size, slot_offset = self._get_dp_gather_slot(ngram_ids.shape[0])
         gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
-        embeddings = super().forward(gathered_ids)
+        if (
+            isinstance(getattr(self, "embedding_method", None), Qwen4ExpPLENgq2EmbeddingMethod)
+            and self.weight.is_cuda
+        ):
+            # Fused gather+decode with shard masking; bf16 ETP all-reduce inside.
+            embeddings = self.embedding_method.lookup_decoded(self, gathered_ids)
+        else:
+            embeddings = super().forward(gathered_ids)
         return self._select_embeddings(
             embeddings,
             ngram_ids.shape[0],
@@ -414,16 +519,18 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             data_parallel_rank=data_parallel_rank,
         )
         self._uva_weight = get_accelerator_view_from_cpu_tensor(self.weight)
-        self._block_d = triton.next_power_of_2(self.embedding_dim)
+        # Row width in storage elements: embedding_dim for bf16/fp8, the record size for NGQ2.
+        self._row_elems = int(self.weight.shape[1])
+        self._block_d = triton.next_power_of_2(self._row_elems)
         self._prefetch_stream = torch.cuda.Stream(device=self._uva_weight.device)
         self._prefetch_buffer = torch.empty(
             max_total_tokens * self.etp_data_parallel_size,
             num_ngram_heads,
-            self.embedding_dim,
+            self._row_elems,
             dtype=self.weight.dtype,
             device=self._uva_weight.device,
         )
-        self._output_dim = num_ngram_heads * self.embedding_dim
+        self._output_dim = num_ngram_heads * self._row_elems
 
     def allocate_embedding_weight(
         self,
@@ -446,7 +553,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Look up local ETP rows while preserving the weight storage dtype."""
-        expected_shape = (*input_ids.shape, self.embedding_dim)
+        expected_shape = (*input_ids.shape, self._row_elems)
         if output is None:
             output = torch.empty(
                 expected_shape,
@@ -469,7 +576,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
                 self._uva_weight,
                 flat_ids,
                 output,
-                self.embedding_dim,
+                self._row_elems,
                 self.shard_indices.org_vocab_start_index,
                 self.shard_indices.org_vocab_end_index,
                 BLOCK_D=self._block_d,
@@ -493,8 +600,8 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         if self.tp_size == 1:
             return embeddings
         assert self.parallel_group is not None
-        if embeddings.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            # Each vocabulary row has one owner, so reduce the raw FP8 bytes.
+        if embeddings.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8):
+            # Each vocabulary row has one owner, so reduce the raw FP8 / NGQ2 bytes.
             reduced = self.parallel_group.all_reduce(embeddings.view(torch.int8))
             return reduced.view(embeddings.dtype)
         return self.parallel_group.all_reduce(embeddings)

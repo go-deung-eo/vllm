@@ -23,6 +23,7 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLEPinnedHostEmbedding,
+    Qwen4ExpPLENgq2EmbeddingMethod,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
 )
 from .ops.ple import ple_ngram_ids
@@ -35,6 +36,7 @@ __all__ = [
     "Qwen4ExpPLEEmbeddingMethod",
     "Qwen4ExpPLEFp8EmbeddingMethod",
     "Qwen4ExpPLEPinnedHostEmbedding",
+    "Qwen4ExpPLENgq2EmbeddingMethod",
     "Qwen4ExpPLEUnquantizedEmbeddingMethod",
     "Qwen4ExpNGramEmbedding",
 ]
@@ -427,7 +429,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     0,
                     min(shard_size, embedding.org_vocab_size - checkpoint_start),
                 )
-                expected_shape = (expected_rows, embedding.embedding_dim)
+                # Row width in storage elements (embedding_dim, or the record size for NGQ2).
+                expected_shape = (expected_rows, embedding.weight.shape[1])
                 if tuple(loaded_weight.shape) != expected_shape:
                     raise ValueError(
                         f"Shape mismatch for PLE embedding shard {shard_index}: "
