@@ -5,11 +5,14 @@
 from collections.abc import Callable
 from functools import cache
 
+import os
+
 import torch
 import torch.nn.functional as F
 
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
+    get_tensor_model_parallel_rank,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_gather,
 )
@@ -51,6 +54,23 @@ def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     if impl is None or not scores.is_cuda:
         return torch.topk(scores, k, dim=-1)
     return impl(scores, k, sorted=True, deterministic=True)
+
+
+_DUMP_DIR = os.environ.get("VLLM_DUMP_LOGITS_DIR")
+_DUMP_STATE = {"n": 0}
+
+
+def _maybe_dump_logits(logits: torch.Tensor) -> None:
+    """Measurement hook (off unless VLLM_DUMP_LOGITS_DIR is set): save the full-vocab prompt logits of each
+    prefill as fp16 so KL between two servers can be computed offline. Armed only while <dir>/ARMED exists;
+    rows < 64 (sampling steps) are skipped."""
+    if _DUMP_DIR is None or logits.shape[0] < 64 or not os.path.exists(os.path.join(_DUMP_DIR, "ARMED")):
+        return
+    if get_tensor_model_parallel_rank() != 0:
+        return
+    n = _DUMP_STATE["n"]
+    _DUMP_STATE["n"] = n + 1
+    torch.save(logits.detach().to(torch.float16).cpu(), os.path.join(_DUMP_DIR, f"{n:06d}_{logits.shape[0]}.pt"))
 
 
 # --8<-- [start:logits_processor]
@@ -117,6 +137,8 @@ class LogitsProcessor(PluggableLayer):
 
             if self.scale != 1.0:
                 logits *= self.scale
+        if logits is not None:
+            _maybe_dump_logits(logits)
         return logits
 
     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
