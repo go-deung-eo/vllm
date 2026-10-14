@@ -10,6 +10,7 @@ embedding fuses the token embedding with hashed embeddings of the preceding
 ``get_model_state_cls`` makes the model MRV2-only.
 """
 
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -20,6 +21,7 @@ from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.ngq_tile_codec import decode_tile_rows, hyb_lut
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -82,9 +84,17 @@ class NgramEmbedding(nn.Module):
         self._offsets = offsets  # len num_embedders + 1
         self._sizes = sizes
 
-        self.oe_embedder = VocabParallelEmbedding(
-            offsets[-1], oe_dim, params_dtype=self._dtype
-        )
+        # NGQ2 tile16 2-bit tables (checkpoint config `ngram_table_format`): replicated packed codes
+        # decoded row by row at lookup instead of the bf16 oe_embedder.
+        self.table_format = getattr(self.config, "ngram_table_format", None)
+        if self.table_format == "ngq2-tile16":
+            assert oe_dim == 256, oe_dim
+            self._init_packed_tables(sizes, offsets)
+            self.oe_embedder = None
+        else:
+            self.oe_embedder = VocabParallelEmbedding(
+                offsets[-1], oe_dim, params_dtype=self._dtype
+            )
         # Stacked projections: oe_projection[i] = post_projs[i].weight.T
         self.oe_projection = nn.Parameter(
             torch.empty(
@@ -114,6 +124,58 @@ class NgramEmbedding(nn.Module):
             persistent=False,
         )
 
+    def _init_packed_tables(self, sizes: list[int], offsets: list[int]) -> None:
+        blocks = [(n + 15) // 16 for n in sizes]
+        boff = [0]
+        for b in blocks:
+            boff.append(boff[-1] + b)
+        self.packed_cpu_offload = os.environ.get("VLLM_NGQ_TILE_CPU_OFFLOAD", "0") == "1"
+        kw = {"device": "cpu", "pin_memory": True} if self.packed_cpu_offload else {}
+        self.packed_sym = nn.Parameter(
+            torch.zeros(boff[-1] * 1024, dtype=torch.uint8, **kw), requires_grad=False
+        )
+        self.packed_gain = nn.Parameter(
+            torch.zeros(offsets[-1], dtype=torch.bfloat16, **kw), requires_grad=False
+        )
+        self.packed_tlut = nn.Parameter(torch.zeros(512, 2, dtype=torch.float32), requires_grad=False)
+        scales = getattr(self.config, "ngram_table_scales", None)
+        assert scales is not None and len(scales) == len(sizes), "ngq2-tile16 needs ngram_table_scales"
+        self.register_buffer("packed_scales", torch.tensor(scales, dtype=torch.float32), persistent=False)
+        self.register_buffer("packed_block_off", torch.tensor(boff[:-1], dtype=torch.int64), persistent=False)
+        self.register_buffer("packed_row_off", torch.tensor(offsets[:-1], dtype=torch.int64), persistent=False)
+        self._packed_blocks = blocks
+        self._lut: torch.Tensor | None = None
+        self._uva: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def _packed_storage(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.packed_cpu_offload:
+            return self.packed_sym.data, self.packed_gain.data
+        if self._uva is None:
+            from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+            self._uva = (
+                get_accelerator_view_from_cpu_tensor(self.packed_sym.data),
+                get_accelerator_view_from_cpu_tensor(self.packed_gain.data),
+            )
+        return self._uva
+
+    def packed_lookup(self, flat_ids: torch.Tensor) -> torch.Tensor:
+        """flat_ids [E, N] global n-gram ids -> bf16 [E, N, 256] decoded rows."""
+        if self._lut is None:
+            assert bool(torch.any(self.packed_tlut != 0)), "ngq2-tile16 checkpoint is missing its tlut"
+            self._lut = hyb_lut(self.packed_tlut.data.to(flat_ids.device))
+        e_cnt, n = flat_ids.shape
+        row_off = self.packed_row_off.to(flat_ids.device)[:, None]
+        local = flat_ids - row_off
+        blk = self.packed_block_off.to(flat_ids.device)[:, None] + (local >> 4)
+        r = (local & 15).to(torch.int32)
+        w = self.packed_scales.to(flat_ids.device)[:, None].expand(e_cnt, n)
+        sym, gain = self._packed_storage()
+        out = decode_tile_rows(
+            sym, gain, self._lut, blk.reshape(-1), r.reshape(-1), flat_ids.reshape(-1), w.reshape(-1).contiguous()
+        )
+        return out.view(e_cnt, n, 256)
+
     def load_weight(self, weight_name: str, loaded_weight: torch.Tensor) -> str:
         """Split a per-embedder checkpoint weight into the sharded layout.
 
@@ -121,6 +183,25 @@ class NgramEmbedding(nn.Module):
         enclosing model) so the caller can mark it loaded for completeness
         checks.
         """
+        if weight_name.endswith("ngram_embeddings.tlut"):
+            self.packed_tlut.data.copy_(loaded_weight.float())
+            return "ngram_embeddings.packed_tlut"
+        if "ngram_embeddings.embedders." in weight_name and self.oe_embedder is None:
+            index = int(
+                weight_name.split("ngram_embeddings.embedders.")[1].split(".")[0]
+            )
+            lo, hi = self._offsets[index], self._offsets[index + 1]
+            if weight_name.endswith(".weight.sym"):
+                b0 = int(self.packed_block_off[index])
+                flat = loaded_weight.reshape(-1)
+                assert flat.numel() == self._packed_blocks[index] * 1024, (flat.numel(), self._packed_blocks[index])
+                self.packed_sym.data[b0 * 1024 : b0 * 1024 + flat.numel()].copy_(flat)
+                return "ngram_embeddings.packed_sym"
+            if weight_name.endswith(".weight.gain"):
+                assert loaded_weight.numel() == hi - lo, (loaded_weight.numel(), hi - lo)
+                self.packed_gain.data[lo:hi].copy_(loaded_weight.to(torch.bfloat16))
+                return "ngram_embeddings.packed_gain"
+            raise AssertionError(f"Unexpected packed ngram weight: {weight_name}")
         if "ngram_embeddings.embedders." in weight_name:
             index = int(
                 weight_name.split("ngram_embeddings.embedders.")[1].split(".")[0]
@@ -160,7 +241,10 @@ class NgramEmbedding(nn.Module):
         """
         word = self.word_embeddings(input_ids)  # [N, H]
         flat = oe_ids.permute(1, 0).contiguous()  # [num_embedders, N]
-        oe = self.oe_embedder(flat)  # [num_embedders, N, oe_dim]
+        if self.oe_embedder is None:
+            oe = self.packed_lookup(flat)  # [num_embedders, N, 256] decoded from 2-bit codes
+        else:
+            oe = self.oe_embedder(flat)  # [num_embedders, N, oe_dim]
         proj = torch.bmm(oe, self.oe_projection)  # [num_embedders, N, H]
         all_h = torch.cat([word.unsqueeze(0), proj], dim=0)  # [ne+1, N, H]
         return all_h.mean(dim=0)  # [N, H]
@@ -195,6 +279,7 @@ class FlashNgramModel(FlashModel):
             if self.ngram_embeddings is not None and (
                 "ngram_embeddings.embedders." in name
                 or "ngram_embeddings.post_projs." in name
+                or name.endswith("ngram_embeddings.tlut")
             ):
                 loaded.add(self.ngram_embeddings.load_weight(name, w))
             else:

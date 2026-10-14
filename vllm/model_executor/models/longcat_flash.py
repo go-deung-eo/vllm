@@ -693,6 +693,15 @@ class FlashModel(nn.Module):
                 # Guard against compounding on incremental load_weights calls:
                 # the in-place ``*=`` would otherwise re-apply the MLA LoRA
                 # scaling to the layernorm weights on each pass.
+                # A layernorm weight (re)loaded in THIS call is raw again, so its
+                # flag must be reset; otherwise a checkpoint whose file order
+                # splits the stream into several load_weights calls (e.g. extra
+                # shards sorting after lm_head) ends up with unscaled layernorms.
+                ln_prefix = f"layers.{layer_id}.self_attn.{i}."
+                if ln_prefix + "q_a_layernorm.weight" in loaded_params:
+                    self_attn._mla_q_lora_scaled = False
+                if ln_prefix + "kv_a_layernorm.weight" in loaded_params:
+                    self_attn._mla_kv_lora_scaled = False
                 if self.config.mla_scale_q_lora and not getattr(
                     self_attn, "_mla_q_lora_scaled", False
                 ):
